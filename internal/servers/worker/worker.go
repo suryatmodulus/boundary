@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,11 @@ import (
 	"google.golang.org/grpc/resolver/manual"
 )
 
+const (
+	defaultStatusGracePeriod = 15 * time.Second
+	statusGracePeriodEnvVar  = "BOUNDARY_STATUS_GRACE_PERIOD"
+)
+
 type Worker struct {
 	conf   *Config
 	logger hclog.Logger
@@ -28,8 +34,9 @@ type Worker struct {
 	started     *ua.Bool
 
 	controllerStatusConn *atomic.Value
-	workerStartTime      time.Time
 	lastStatusSuccess    *atomic.Value
+	workerStartTime      time.Time
+	statusGracePeriod    time.Duration
 
 	controllerResolver *atomic.Value
 
@@ -58,6 +65,7 @@ func New(conf *Config) (*Worker, error) {
 		tags:                  new(atomic.Value),
 	}
 
+	w.setStatusGracePeriod()
 	w.lastStatusSuccess.Store((*LastStatusInformation)(nil))
 	w.controllerResolver.Store((*manual.Resolver)(nil))
 
@@ -95,6 +103,52 @@ func New(conf *Config) (*Worker, error) {
 	}
 
 	return w, nil
+}
+
+// setStatusGracePeriod returns the status grace period setting for this
+// worker, in seconds.
+//
+// The grace period is the length of time we allow connections to run
+// on a worker in the event of an error sending status updates. The
+// period is defined the length of time since the last successful
+// update.
+//
+// The setting is derived from one of the following:
+//
+//   * Through configuration,
+//   * BOUNDARY_STATUS_GRACE_PERIOD, if defined, can be set to an
+//   integer value to define the setting.
+//   * If either of these is missing, the default (15 seconds) is
+//   used.
+//
+// The minimum setting for this value is the default setting. Values
+// below this will be reset to the default.
+func (w *Worker) setStatusGracePeriod() {
+	var result time.Duration
+	switch {
+	case w.conf.RawConfig.Worker.StatusGracePeriodDuration > 0:
+		result = w.conf.RawConfig.Worker.StatusGracePeriodDuration
+	case os.Getenv(statusGracePeriodEnvVar) != "":
+		v := os.Getenv(statusGracePeriodEnvVar)
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			w.logger.Error("could not read setting for BOUNDARY_STATUS_GRACE_PERIOD",
+				"err", err,
+				"value", v,
+			)
+			break
+		}
+
+		result = time.Second * time.Duration(n)
+	}
+
+	if result < defaultStatusGracePeriod {
+		w.logger.Debug("invalid grace period setting or none provided, using default", "value", result, "default", defaultStatusGracePeriod)
+		result = defaultStatusGracePeriod
+	}
+
+	w.logger.Debug("session cleanup will disconnect connections if status report cannot be made to controllers", "grace_period", result)
+	w.statusGracePeriod = result
 }
 
 func (w *Worker) Start() error {

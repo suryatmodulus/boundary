@@ -4,7 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"os"
+	"strconv"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/boundary/internal/auth/oidc"
 	"github.com/hashicorp/boundary/internal/auth/password"
@@ -27,6 +30,11 @@ import (
 	ua "go.uber.org/atomic"
 )
 
+const (
+	defaultStatusGracePeriod = 15 * time.Second
+	statusGracePeriodEnvVar  = "BOUNDARY_STATUS_GRACE_PERIOD"
+)
+
 type Controller struct {
 	conf   *Config
 	logger hclog.Logger
@@ -37,8 +45,12 @@ type Controller struct {
 
 	workerAuthCache *cache.Cache
 
-	// Used for testing
+	// Used for testing and tracking worker health
 	workerStatusUpdateTimes *sync.Map
+
+	// Used by session cleanup job to remove connections for
+	// non-responsive workers
+	statusGracePeriod time.Duration
 
 	// Repo factory methods
 	AuthTokenRepoFn    common.AuthTokenRepoFactory
@@ -63,6 +75,7 @@ func New(conf *Config) (*Controller, error) {
 		workerStatusUpdateTimes: new(sync.Map),
 	}
 
+	c.setStatusGracePeriod()
 	c.started.Store(false)
 
 	if conf.SecureRandomReader == nil {
@@ -151,6 +164,52 @@ func New(conf *Config) (*Controller, error) {
 	return c, nil
 }
 
+// setStatusGracePeriod returns the status grace period setting for this
+// controller, in seconds.
+//
+// The grace period is the length of time we allow connections to run
+// on a worker in the event of an error sending status updates. The
+// period is defined the length of time since the last successful
+// update.
+//
+// The setting is derived from one of the following:
+//
+//   * Through configuration,
+//   * BOUNDARY_STATUS_GRACE_PERIOD, if defined, can be set to an
+//   integer value to define the setting.
+//   * If either of these is missing, the default (15 seconds) is
+//   used.
+//
+// The minimum setting for this value is the default setting. Values
+// below this will be reset to the default.
+func (c *Controller) setStatusGracePeriod() {
+	var result time.Duration
+	switch {
+	case c.conf.RawConfig.Controller.StatusGracePeriodDuration > 0:
+		result = c.conf.RawConfig.Controller.StatusGracePeriodDuration
+	case os.Getenv(statusGracePeriodEnvVar) != "":
+		v := os.Getenv(statusGracePeriodEnvVar)
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			c.logger.Error("could not read setting for BOUNDARY_STATUS_GRACE_PERIOD",
+				"err", err,
+				"value", v,
+			)
+			break
+		}
+
+		result = time.Second * time.Duration(n)
+	}
+
+	if result < defaultStatusGracePeriod {
+		c.logger.Debug("invalid grace period setting or none provided, using default", "value", result, "default", defaultStatusGracePeriod)
+		result = defaultStatusGracePeriod
+	}
+
+	c.logger.Debug("session cleanup will mark connections as closed if status reports are not received from workers", "grace_period", result)
+	c.statusGracePeriod = result
+}
+
 func (c *Controller) Start() error {
 	if c.started.Load() {
 		c.logger.Info("already started, skipping")
@@ -178,6 +237,24 @@ func (c *Controller) Start() error {
 }
 
 func (c *Controller) registerJobs() error {
+	if err := c.registerSessionCleanupJob(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// registerSessionCleanupJob is a helper method to abstract
+// registering the session cleanup job specifically.
+func (c *Controller) registerSessionCleanupJob() error {
+	sessionCleanupJob, err := newSessionCleanupJob(c.logger, c.ServersRepoFn, c.SessionRepoFn, c.statusGracePeriod)
+	if err != nil {
+		return fmt.Errorf("error creating session cleanup job: %w", err)
+	}
+	if err = c.scheduler.RegisterJob(c.baseContext, sessionCleanupJob); err != nil {
+		return fmt.Errorf("error registering session cleanup job: %w", err)
+	}
+
 	return nil
 }
 

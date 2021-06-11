@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/boundary/internal/cmd/base"
 	"github.com/hashicorp/boundary/internal/cmd/config"
@@ -116,6 +117,10 @@ type TestWorkerOpts struct {
 
 	// The logger to use, or one will be created
 	Logger hclog.Logger
+
+	// The amount of time to wait before marking connections as closed when a
+	// connection cannot be made back to the controller
+	StatusGracePeriodDuration time.Duration
 }
 
 func NewTestWorker(t *testing.T, opts *TestWorkerOpts) *TestWorker {
@@ -145,6 +150,10 @@ func NewTestWorker(t *testing.T, opts *TestWorkerOpts) *TestWorker {
 			t.Fatal(err)
 		}
 		opts.Config.Worker.Name = opts.Name
+	}
+
+	if opts.StatusGracePeriodDuration > 0 {
+		opts.Config.Worker.StatusGracePeriodDuration = opts.StatusGracePeriodDuration
 	}
 
 	if len(opts.InitialControllers) > 0 {
@@ -218,10 +227,11 @@ func (tw *TestWorker) AddClusterWorkerMember(t *testing.T, opts *TestWorkerOpts)
 		opts = new(TestWorkerOpts)
 	}
 	nextOpts := &TestWorkerOpts{
-		WorkerAuthKms:      tw.w.conf.WorkerAuthKms,
-		Name:               opts.Name,
-		InitialControllers: tw.ControllerAddrs(),
-		Logger:             tw.w.conf.Logger,
+		WorkerAuthKms:             tw.w.conf.WorkerAuthKms,
+		Name:                      opts.Name,
+		InitialControllers:        tw.ControllerAddrs(),
+		Logger:                    tw.w.conf.Logger,
+		StatusGracePeriodDuration: opts.StatusGracePeriodDuration,
 	}
 	if opts.Logger != nil {
 		nextOpts.Logger = opts.Logger

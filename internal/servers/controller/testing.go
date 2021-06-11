@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/boundary/api"
 	"github.com/hashicorp/boundary/api/authmethods"
@@ -128,6 +129,10 @@ func (tc *TestController) DbConn() *gorm.DB {
 
 func (tc *TestController) Logger() hclog.Logger {
 	return tc.b.Logger
+}
+
+func (tc *TestController) SessionCleanupSatusGracePeriod() time.Duration {
+	return tc.c.statusGracePeriod
 }
 
 func (tc *TestController) Token() *authtokens.AuthToken {
@@ -371,6 +376,10 @@ type TestControllerOpts struct {
 	// A cluster address for overriding the advertised controller listener
 	// (overrides address provided in config, if any)
 	PublicClusterAddr string
+
+	// The amount of time to wait before marking connections as closed when a
+	// worker has not reported in
+	StatusGracePeriodDuration time.Duration
 }
 
 func NewTestController(t *testing.T, opts *TestControllerOpts) *TestController {
@@ -411,6 +420,9 @@ func NewTestController(t *testing.T, opts *TestControllerOpts) *TestController {
 		opts.Config.Controller.Name = opts.Name
 	}
 
+	if opts.StatusGracePeriodDuration > 0 {
+		opts.Config.Controller.StatusGracePeriodDuration = opts.StatusGracePeriodDuration
+	}
 	if opts.DefaultPasswordAuthMethodId != "" {
 		tc.b.DevPasswordAuthMethodId = opts.DefaultPasswordAuthMethodId
 	} else {
@@ -610,6 +622,7 @@ func (tc *TestController) AddClusterControllerMember(t *testing.T, opts *TestCon
 		DisableKmsKeyCreation:       true,
 		DisableAuthMethodCreation:   true,
 		PublicClusterAddr:           opts.PublicClusterAddr,
+		StatusGracePeriodDuration:   opts.StatusGracePeriodDuration,
 	}
 	if opts.Logger != nil {
 		nextOpts.Logger = opts.Logger
